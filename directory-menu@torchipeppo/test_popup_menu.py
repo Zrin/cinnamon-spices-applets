@@ -5,11 +5,16 @@
 # but this method is instantaneous
 
 import subprocess
+import sys
 from pathlib import Path
 import json
 
+# optional first argument: the directory to open (default: home)
+# e.g. `python3 test_popup_menu.py /does/not/exist`
+start_dir = Path(sys.argv[1]).expanduser().absolute() if len(sys.argv) > 1 else Path.home()
+
 args = {
-    "starting_uri": f"file://{Path.home()}",
+    "starting_uri": start_dir.as_uri(),
     "show_hidden": False,
     "x": 0,
     "y": 0,
@@ -18,6 +23,7 @@ args = {
     "favorites_first": False,
     "pinned_first": False,
     "order_by": 1,
+    "show_header": True,
 }
 
 subprocess.run(["python3", "files/directory-menu@torchipeppo/popup_menu.py", json.dumps(args)])

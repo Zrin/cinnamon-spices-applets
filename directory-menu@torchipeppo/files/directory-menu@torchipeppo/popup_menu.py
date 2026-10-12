@@ -54,6 +54,16 @@ def log(message):
         f.write(str(message) + "\n")
     print(message, file=sys.stderr)
 
+def warn(message):
+    # stderr of this script ends up in ~/.xsession-errors
+    print(f"{UUID}: {message}", file=sys.stderr)
+
+ENUMERATE_ATTRIBUTES = 'standard::*,metadata::pinned-to-top,time::modified,time::modified-usec'
+
+TERMINAL_SCHEMA = "org.cinnamon.desktop.default-applications.terminal"
+# tried in this order if the configured terminal is unset or fails to start
+FALLBACK_TERMINALS = ["x-terminal-emulator", "gnome-terminal", "xterm"]
+
 
 def modification_sort_key(info):
     try:
@@ -86,8 +96,43 @@ class Cassettone:
 
         return menu_item
 
+    def new_placeholder_item(self, label_text):
+        item = Gtk.MenuItem.new_with_label(label_text)
+        item.set_sensitive(False)
+        return item
+
+    def list_directory(self, directory):
+        """Return the Gio.FileInfo of every (visible) child. Raises GLib.Error if unreadable."""
+        dir_iter = directory.enumerate_children(
+            ENUMERATE_ATTRIBUTES,
+            Gio.FileQueryInfoFlags.NONE,
+            None
+        )
+        infos = []
+        try:
+            info = dir_iter.next_file(None)
+            while info is not None:
+                if (not info.get_is_hidden() or self.show_hidden):     # // <-- skip hidden files
+                    infos.append(info)
+                info = dir_iter.next_file(None)
+        finally:
+            dir_iter.close(None)
+        return infos
+
     def populate_menu_with_directory(self, menu, directory_uri):
         directory = Gio.File.new_for_uri(directory_uri)
+
+        # Read the directory before adding anything to the menu.
+        # If it doesn't exist or can't be read, show a placeholder instead of
+        # letting the GLib.Error escape: for the base directory that would kill
+        # the script before the menu is ever shown.
+        try:
+            infos = self.list_directory(directory)
+        except GLib.Error as e:
+            warn(f"Cannot read {directory_uri}: {e.message}")
+            menu.append(self.new_placeholder_item(_("Empty or Access Denied")))
+            return
+
         # // First, the two directory actions: Open Folder and Open In Terminal
 
         if self.show_header:
@@ -105,34 +150,30 @@ class Cassettone:
 
         # log(directory_uri)
 
-        dir_iter = directory.enumerate_children(
-            'standard::*,metadata::pinned-to-top,time::modified,time::modified-usec',
-            Gio.FileQueryInfoFlags.NONE,
-            None
-        )
+        if not infos:
+            menu.append(self.new_placeholder_item(_("Empty")))
+            return
 
         priority_bins = defaultdict(list)
 
-        info = dir_iter.next_file(None)
-        while info != None:
-            if (not info.get_is_hidden() or self.show_hidden):     # // <-- skip hidden files
-                info.display_name = info.get_display_name()
-                info.content_type = info.get_content_type()
-                info.file = directory.get_child_for_display_name(info.display_name)
-                info.is_directory = (info.get_content_type() == "inode/directory")
+        for info in infos:
+            info.display_name = info.get_display_name()
+            info.content_type = info.get_content_type()
+            # get_child() takes the on-disk name, so it also works for names that aren't valid UTF-8
+            # (get_child_for_display_name() raises on those)
+            info.file = directory.get_child(info.get_name())
+            info.is_directory = (info.get_content_type() == "inode/directory")
 
-                priority = STANDARD_PRIORITY
-                if self.favorites_first and self.favorites.find_by_uri(info.file.get_uri()):
-                    priority += FAVORITE_PRIORITY_MOD
-                if self.pinned_first and info.get_attribute_as_string("metadata::pinned-to-top") == "true":
-                    priority += PINNED_PRIORITY_MOD
+            priority = STANDARD_PRIORITY
+            if self.favorites_first and self.favorites.find_by_uri(info.file.get_uri()):
+                priority += FAVORITE_PRIORITY_MOD
+            if self.pinned_first and info.get_attribute_as_string("metadata::pinned-to-top") == "true":
+                priority += PINNED_PRIORITY_MOD
 
-                if info.is_directory:
-                    priority += DIRECTORY_PRIORITY_MOD
+            if info.is_directory:
+                priority += DIRECTORY_PRIORITY_MOD
 
-                priority_bins[priority].append(info)
-
-            info = dir_iter.next_file(None)
+            priority_bins[priority].append(info)
 
         for priority in sorted(priority_bins.keys()):
             lst = priority_bins[priority]
@@ -187,10 +228,40 @@ class Cassettone:
             "action": "open_terminal_at_path",
             "path": path,
         }))
-        terminal_preferences = Gio.Settings.new("org.cinnamon.desktop.default-applications.terminal")
-        argv = terminal_preferences.get_string("exec").split()
         spawn_flags = GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.STDOUT_TO_DEV_NULL | GLib.SpawnFlags.STDERR_TO_DEV_NULL
-        GLib.spawn_async(working_directory=path, argv=argv, flags=spawn_flags)
+        for argv in self.get_terminal_commands():
+            if os.path.basename(argv[0]) == "gnome-terminal":
+                # gnome-terminal opens its windows from a separate server process,
+                # so tell it the directory explicitly instead of relying on our cwd
+                argv = argv[:1] + ["--working-directory=" + path] + argv[1:]
+            try:
+                GLib.spawn_async(working_directory=path, argv=argv, flags=spawn_flags)
+                return
+            except GLib.Error as e:
+                # e.g. program not installed, or path not accessible
+                warn(f"Could not start terminal {argv[0]!r} in {path!r}: {e.message}")
+        warn("Could not start any terminal")
+
+    def get_terminal_commands(self):
+        """Candidate argvs: the terminal configured in Cinnamon first, then the fallbacks."""
+        commands = []
+
+        # Gio.Settings.new() aborts the whole process if the schema is missing, so check first
+        schema_source = Gio.SettingsSchemaSource.get_default()
+        if schema_source is not None and schema_source.lookup(TERMINAL_SCHEMA, True) is not None:
+            exec_line = Gio.Settings.new(TERMINAL_SCHEMA).get_string("exec").strip()
+            if exec_line:
+                try:
+                    # handles quoting, unlike str.split()
+                    _parsed, argv = GLib.shell_parse_argv(exec_line)
+                    commands.append(argv)
+                except GLib.Error as e:
+                    warn(f"Cannot parse terminal command {exec_line!r}: {e.message}")
+
+        for name in FALLBACK_TERMINALS:
+            if not any(os.path.basename(argv[0]) == name for argv in commands):
+                commands.append([name])
+        return commands
 
     def destroy_subitem_later(self, subItem):
         def g2():
