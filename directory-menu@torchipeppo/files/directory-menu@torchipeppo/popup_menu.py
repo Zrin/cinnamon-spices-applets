@@ -60,9 +60,26 @@ def warn(message):
 
 ENUMERATE_ATTRIBUTES = 'standard::*,metadata::pinned-to-top,time::modified,time::modified-usec'
 
+DESKTOP_SUFFIX = ".desktop"
+# shown dimmed at the right of launcher entries; the first one the icon theme has is used
+LAUNCHER_MARK_ICONS = ["system-run-symbolic", "media-playback-start-symbolic"]
+
 TERMINAL_SCHEMA = "org.cinnamon.desktop.default-applications.terminal"
 # tried in this order if the configured terminal is unset or fails to start
 FALLBACK_TERMINALS = ["x-terminal-emulator", "gnome-terminal", "xterm"]
+# the option after which the rest of the command line is the program to run;
+# used for the fallbacks, and when Cinnamon's "exec-arg" setting is empty
+KNOWN_EXEC_ARGS = {
+    "x-terminal-emulator": ["-e"],  # Debian policy: -e takes the command and its args
+    "gnome-terminal": ["--"],
+    "xterm": ["-e"],
+    "konsole": ["-e"],
+    "xfce4-terminal": ["-x"],
+    "mate-terminal": ["-x"],
+    "terminator": ["-x"],
+    "alacritty": ["-e"],
+    "kitty": [],
+}
 
 
 def modification_sort_key(info):
@@ -84,7 +101,7 @@ SORT_KEYS = [
 class Cassettone:
 
     # https://lazka.github.io/pgi-docs/index.html#Gtk-3.0/classes/ImageMenuItem.html
-    def new_image_menu_item(self, label_text, icon):
+    def new_image_menu_item(self, label_text, icon, trailing_icon_name=None):
         box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6)
         label = Gtk.Label.new(label_text)
         menu_item = Gtk.MenuItem.new()
@@ -92,9 +109,21 @@ class Cassettone:
         box.add(icon)
         box.add(label)
 
+        if trailing_icon_name:
+            trailing = Gtk.Image.new_from_icon_name(trailing_icon_name, Gtk.IconSize.MENU)
+            trailing.get_style_context().add_class("dim-label")
+            box.pack_end(trailing, False, False, 0)
+
         menu_item.add(box)
 
         return menu_item
+
+    def get_launcher_mark_icon_name(self):
+        if not hasattr(self, "_launcher_mark_icon_name"):
+            theme = Gtk.IconTheme.get_default()
+            self._launcher_mark_icon_name = next(
+                (name for name in LAUNCHER_MARK_ICONS if theme.has_icon(name)), None)
+        return self._launcher_mark_icon_name
 
     def new_placeholder_item(self, label_text):
         item = Gtk.MenuItem.new_with_label(label_text)
@@ -183,21 +212,38 @@ class Cassettone:
 
     def add_to_menu_from_gioinfo(self, menu, info):
         display_text = info.display_name
+        icon = Gio.content_type_get_icon(info.content_type)
+        trailing_icon_name = None
+
+        # Launchers that will actually launch when clicked get their app's icon,
+        # lose the ".desktop" extension and are marked on the right.
+        # Untrusted or broken ones keep looking like the plain files they open as.
+        launcher = None
+        path = info.file.get_path()
+        if not info.is_directory and path is not None and self.is_desktop_file(path, info.content_type):
+            launcher, _reason = self.read_launcher(path)
+        if launcher is not None:
+            icon = launcher["icon"]
+            if display_text.lower().endswith(DESKTOP_SUFFIX) and len(display_text) > len(DESKTOP_SUFFIX):
+                display_text = display_text[:-len(DESKTOP_SUFFIX)]
+            trailing_icon_name = self.get_launcher_mark_icon_name()
+
         if self.character_limit > -1 and len(display_text) > self.character_limit:
             display_text = display_text[:self.character_limit] + "..."
 
-        icon = Gio.content_type_get_icon(info.content_type)
         image = Gtk.Image.new_from_gicon(icon, Gtk.IconSize.MENU)
 
         uri = info.file.get_uri()
 
-        item = self.new_image_menu_item(display_text, image)
+        item = self.new_image_menu_item(display_text, image, trailing_icon_name)
+        if launcher is not None:
+            item.set_tooltip_text(info.display_name)  # the real file name
 
         if info.is_directory:
             subMenu = self.create_subdirectory_submenu(uri)
             item.set_submenu(subMenu)
         else:
-            item.connect("activate", lambda _: self.launch(uri, Gtk.get_current_event_time()))
+            item.connect("activate", lambda _: self.open_file(info.file, info.content_type))
 
         menu.append(item)
 
@@ -223,44 +269,175 @@ class Cassettone:
         }))
         subprocess.run(['/usr/bin/xdg-open', uri], check=False)
 
+    def open_file(self, file, content_type):
+        """Activate a file entry: start launchers, run scripts, open everything else."""
+        path = file.get_path()  # None for files that aren't on a local or FUSE-mounted filesystem
+        if path is not None:
+            # check launchers first: many start with "#!/usr/bin/env xdg-open" and are executable
+            if self.is_desktop_file(path, content_type):
+                if self.launch_desktop_file(path):
+                    return
+            elif self.is_executable_script(path):
+                self.run_in_terminal(path)
+                return
+        self.launch(file.get_uri(), Gtk.get_current_event_time())
+
+    def is_executable_script(self, path):
+        """True for a regular file with the executable bit that starts with a #! line."""
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            return False
+        try:
+            with open(path, "rb") as f:
+                return f.read(2) == b"#!"
+        except OSError:
+            return False
+
+    def is_desktop_file(self, path, content_type):
+        return path.endswith(DESKTOP_SUFFIX) or Gio.content_type_is_a(content_type, "application/x-desktop")
+
+    def read_launcher(self, path):
+        """Check whether a .desktop file can be launched.
+
+        Returns (launcher, None), where launcher is a dict with "icon" (Gio.Icon) and either
+        "app_info" (Gio.DesktopAppInfo) or "url", or (None, reason) if it can't be launched."""
+        # Like Nemo, only trust launchers that are marked executable: a .desktop file
+        # can run any command, and a downloaded one could be disguised as a document.
+        # Untrusted ones are opened like any other file (usually in a text editor).
+        if not os.access(path, os.X_OK):
+            return None, "not marked executable, so not trusted"
+
+        keyfile = GLib.KeyFile()
+        try:
+            keyfile.load_from_file(path, GLib.KeyFileFlags.NONE)
+            entry_type = keyfile.get_string("Desktop Entry", "Type")
+        except GLib.Error as e:
+            return None, e.message
+
+        if entry_type == "Link":
+            try:
+                url = keyfile.get_string("Desktop Entry", "URL")
+            except GLib.Error as e:
+                return None, e.message
+            try:
+                # handles both icon names and absolute paths
+                icon = Gio.Icon.new_for_string(keyfile.get_string("Desktop Entry", "Icon"))
+            except (GLib.Error, TypeError):
+                icon = Gio.ThemedIcon.new("text-html")
+            return {"icon": icon, "app_info": None, "url": url}, None
+
+        # fails if it isn't a valid application launcher, or its TryExec/Exec program is missing
+        # (PyGObject raises TypeError "constructor returned NULL" rather than returning None)
+        try:
+            app_info = Gio.DesktopAppInfo.new_from_filename(path)
+        except TypeError:
+            app_info = None
+        if app_info is None:
+            return None, "not a valid application launcher, or its program is not installed"
+        icon = app_info.get_icon() or Gio.ThemedIcon.new("application-x-executable")
+        return {"icon": icon, "app_info": app_info, "url": None}, None
+
+    def launch_desktop_file(self, path):
+        """Start a .desktop launcher. Returns False if it should be opened as a plain file instead."""
+        launcher, reason = self.read_launcher(path)
+        if launcher is None:
+            warn(f"Not launching {path!r}: {reason}")
+            return False
+
+        if launcher["url"] is not None:
+            self.launch(launcher["url"], Gtk.get_current_event_time())
+            return True
+
+        app_info = launcher["app_info"]
+        try:
+            app_info.launch([], self.new_launch_context())
+        except GLib.Error as e:
+            warn(f"Failed to launch {path!r}: {e.message}")
+            return True  # don't fall back to opening it in an editor, that would be confusing
+
+        # D-Bus activatable apps are started with an asynchronous D-Bus call;
+        # make sure the message is sent before this short-lived process exits
+        try:
+            Gio.bus_get_sync(Gio.BusType.SESSION, None).flush_sync(None)
+        except GLib.Error:
+            pass
+        return True
+
+    def new_launch_context(self):
+        # gives the launched app a startup notification and the click's timestamp (for focus)
+        display = Gdk.Display.get_default()
+        if display is None:
+            return None
+        context = display.get_app_launch_context()
+        context.set_timestamp(Gtk.get_current_event_time())
+        return context
+
+    def run_in_terminal(self, path):
+        print(json.dumps({
+            "action": "run_in_terminal",
+            "path": path,
+        }))
+        # Keep the window open after the script ends, otherwise its output
+        # would vanish together with the terminal.
+        command = [
+            "sh", "-c", '"$1"; printf "\\n%s" "$2"; read -r _',
+            "sh", path, _("Press Enter to close this window."),
+        ]
+        self.spawn_terminal(os.path.dirname(path), command)
+
     def open_terminal_at_path(self, path):
         print(json.dumps({
             "action": "open_terminal_at_path",
             "path": path,
         }))
+        self.spawn_terminal(path)
+
+    def spawn_terminal(self, working_directory, command=None):
+        """Open a terminal in working_directory, running command (an argv list) if given."""
         spawn_flags = GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.STDOUT_TO_DEV_NULL | GLib.SpawnFlags.STDERR_TO_DEV_NULL
-        for argv in self.get_terminal_commands():
+        for argv, exec_args in self.get_terminal_commands():
             if os.path.basename(argv[0]) == "gnome-terminal":
                 # gnome-terminal opens its windows from a separate server process,
                 # so tell it the directory explicitly instead of relying on our cwd
-                argv = argv[:1] + ["--working-directory=" + path] + argv[1:]
+                argv = argv[:1] + ["--working-directory=" + working_directory] + argv[1:]
+            if command:
+                argv = argv + exec_args + command
             try:
-                GLib.spawn_async(working_directory=path, argv=argv, flags=spawn_flags)
-                return
+                GLib.spawn_async(working_directory=working_directory, argv=argv, flags=spawn_flags)
+                return True
             except GLib.Error as e:
-                # e.g. program not installed, or path not accessible
-                warn(f"Could not start terminal {argv[0]!r} in {path!r}: {e.message}")
+                # e.g. program not installed, or directory not accessible
+                warn(f"Could not start terminal {argv[0]!r} in {working_directory!r}: {e.message}")
         warn("Could not start any terminal")
+        return False
 
     def get_terminal_commands(self):
-        """Candidate argvs: the terminal configured in Cinnamon first, then the fallbacks."""
+        """Candidate (argv, exec_args) pairs: the terminal configured in Cinnamon first, then the fallbacks.
+
+        exec_args is what goes between the terminal's argv and a command it should run (e.g. ["-x"])."""
         commands = []
 
         # Gio.Settings.new() aborts the whole process if the schema is missing, so check first
         schema_source = Gio.SettingsSchemaSource.get_default()
-        if schema_source is not None and schema_source.lookup(TERMINAL_SCHEMA, True) is not None:
-            exec_line = Gio.Settings.new(TERMINAL_SCHEMA).get_string("exec").strip()
+        schema = schema_source.lookup(TERMINAL_SCHEMA, True) if schema_source is not None else None
+        if schema is not None:
+            settings = Gio.Settings.new(TERMINAL_SCHEMA)
+            exec_line = settings.get_string("exec").strip()
+            exec_arg_line = settings.get_string("exec-arg").strip() if schema.has_key("exec-arg") else ""
             if exec_line:
                 try:
                     # handles quoting, unlike str.split()
                     _parsed, argv = GLib.shell_parse_argv(exec_line)
-                    commands.append(argv)
+                    if exec_arg_line:
+                        exec_args = GLib.shell_parse_argv(exec_arg_line)[1]
+                    else:
+                        exec_args = KNOWN_EXEC_ARGS.get(os.path.basename(argv[0]), [])
+                    commands.append((argv, exec_args))
                 except GLib.Error as e:
-                    warn(f"Cannot parse terminal command {exec_line!r}: {e.message}")
+                    warn(f"Cannot parse terminal command {exec_line!r} {exec_arg_line!r}: {e.message}")
 
         for name in FALLBACK_TERMINALS:
-            if not any(os.path.basename(argv[0]) == name for argv in commands):
-                commands.append([name])
+            if not any(os.path.basename(argv[0]) == name for argv, _args in commands):
+                commands.append(([name], KNOWN_EXEC_ARGS[name]))
         return commands
 
     def destroy_subitem_later(self, subItem):

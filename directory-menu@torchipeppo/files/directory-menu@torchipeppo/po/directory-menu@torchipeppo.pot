@@ -33,6 +33,10 @@ msgstr ""
 msgid "Empty"
 msgstr ""
 
+#. popup_menu.py:329
+msgid "Press Enter to close this window."
+msgstr ""
+
 #. metadata.json->name
 msgid "Directory Menu"
 msgstr ""
